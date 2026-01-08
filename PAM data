@@ -1,0 +1,525 @@
+# ===== cell 1 =====
+
+import numpy as np
+import math
+from PIL import Image
+import sys
+import os, fnmatch
+import struct
+import glob
+from multiprocessing import Process, Queue
+import time
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib import cm, transforms
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+import matplotlib.patches as patches
+
+from skimage.transform import rescale, resize, downscale_local_mean
+from skimage.morphology import skeletonize
+from skimage import exposure
+from skimage import feature
+from scipy.ndimage import median_filter
+from scipy.signal import decimate, firwin
+from scipy.interpolate import interp1d
+
+import scipy.signal as signal
+import scipy.interpolate as interpolate
+import scipy.ndimage as ndimage
+import nrrd
+import pandas as pd
+%matplotlib inline
+
+# ===== cell 2 =====
+
+def norm(arr_):
+    norm_arr = (arr_ - np.min(arr_)) / (np.max(arr_) - np.min(arr_))
+    return norm_arr
+
+def norm0(arr_):
+    norm_arr = (arr_ - 0) / (np.max(np.abs(arr_)) - 0)
+    return norm_arr
+
+def norm_mean(arr_):
+    norm_arr= (arr_ - np.mean(arr_)) / (np.max(arr_) - np.mean(arr_))
+    return norm_arr
+
+# ===== cell 3 =====
+
+def TF(T):
+    N = len(T)
+    results = []
+    for k in range(N): # this goes from 0 to N-1
+        Tk = 0 # Tk here
+        for l in range(N): # this goes from 0 to N-1
+            Tk += (T[l])*np.exp((-2j*np.pi*k*l)/N)
+        results.append(Tk) # store the result
+    return np.array(results) # return the results
+
+
+# ===== cell 4 =====
+
+def interp2d_interleave(z,n):
+    '''performs linear interpolation on a grid
+
+    all points are interpolated in one step not recursively
+
+    Parameters
+    ----------
+    z : 2d array (M,N)
+    n : int
+    number of points interpolated
+
+    Returns
+    -------
+    zi : 2d array ((M-1)*n+M, (N-1)*n+N)
+        original and linear interpolated values
+
+    '''
+    frac = cp.atleast_2d(cp.arange(0,n+1)/(1.0+n)).T
+    zi1 = cp.kron(z[:,:-1],cp.ones(len(frac))) + cp.kron(cp.diff(z),frac.T)
+    zi1 = cp.hstack((zi1,z[:,-1:]))
+    zi2 = cp.kron(zi1.T[:,:-1],cp.ones(len(frac))) + cp.kron(cp.diff(zi1.T),frac.T)
+    zi2 = cp.hstack((zi2,zi1.T[:,-1:]))
+    return zi2.T
+
+def interp2d_interleave_recursive(z,n):
+    '''interpolates by recursively interleaving n times
+    '''
+    zi = z.copy()
+    for ii in range(1,n+1):
+        zi = interp2d_interleave(zi,1)
+    return zi
+
+# ===== cell 5 =====
+
+def flip180(arr):
+    new_arr = arr.reshape(arr.size)
+    new_arr = new_arr[::-1]
+    new_arr = new_arr.reshape(arr.shape)
+    return new_arr
+
+# ===== cell 6 =====
+
+def find_nearest(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return idx
+
+# ===== cell 7 =====
+
+def map_ax(vol_arr,axx):
+    map_xy = np.ndarray.max(vol_arr, axx)
+    return map_xy
+
+def avg_ax(vol_arr,axx):
+    map_xy = np.ndarray.mean(vol_arr, axx)
+    return map_xy
+
+def map_depth(vol_arr,axx):
+    map_xy = np.ndarray.argmax(vol_arr, axx)
+    return map_xy
+
+def cen_depth(vol_arr,axx,lim_top,lim_bot): # center depth between 2 highest peaks
+    sorted_vol_ = np.zeros(cp.shape(vol_arr))
+    for x_id_ in range(np.shape(vol_arr)[0]):
+        for y_id_ in range(np.shape(vol_arr)[1]):
+            sorted_vol_[x_id_,y_id_,:int(lim_bot-lim_top)] = sorted(vol_arr[x_id_,y_id_,lim_top:lim_bot])
+    sorted_vol_ = median_filter(sorted_vol_,3)
+
+    map_xy = np.zeros((np.shape(sorted_vol_)[0],np.shape(sorted_vol_)[1]))
+    for x_id_ in range(np.shape(vol_arr)[0]):
+        for y_id_ in range(np.shape(vol_arr)[1]):
+            map_xy[x_id_,y_id_] = int((find_nearest(vol_arr[x_id_,y_id_,:], sorted_vol_[x_id_,y_id_,0]) - find_nearest(vol_arr[x_id_,y_id_,:], sorted_vol_[x_id_,y_id_,1]))/2)
+    return map_xy
+
+# ===== cell 8 =====
+
+def ext_vol_multi(load_path,cut_left,cut_right,q): ## read binary
+    pathname = glob.glob(load_path)[0]
+    f = open(pathname,"rb")
+    size_of_data = np.fromfile(f, dtype=">I", count = 3)
+    y_axis = size_of_data[0]
+    x_axis = size_of_data[1]
+    z_axis = size_of_data[2]
+
+    raw_data = np.fromfile(f, dtype=">H", count = -1)
+
+    f.close()
+
+    data = np.reshape(raw_data,(y_axis, x_axis, z_axis))
+    reraw_data = np.zeros(data.shape)
+    for i in range(y_axis):
+        reraw_data[i,:,:] = np.abs(signal.hilbert(np.subtract(data[i,:,:],np.mean(data[:,:,:]))))
+    r_data  = reraw_data[:,cut_left:-cut_right,:]
+
+    lowcut = 1e6  # Hz
+    highcut = 70e6  # Hz
+    fs = 500e6
+
+    # Apply bandpass filter
+    f_data = apply_bandpass_filter_3d(r_data, lowcut, highcut, fs)
+    q.put(f_data)
+
+# ===== cell 9 =====
+
+from scipy.signal import butter, filtfilt
+
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def apply_bandpass_filter_3d(data, lowcut, highcut, fs, order=4):
+    """
+    Apply a bandpass filter along the time axis (axis=2) of a 3D array.
+
+    Parameters:
+        data (np.ndarray): 3D array with shape (rows, cols, time)
+        lowcut (float): Low cutoff frequency in Hz
+        highcut (float): High cutoff frequency in Hz
+        fs (float): Sampling frequency in Hz
+        order (int): Order of the Butterworth filter
+
+    Returns:
+        np.ndarray: Filtered 3D array with the same shape
+    """
+    b, a = butter_bandpass(lowcut, highcut, fs, order)
+    filtered_data = np.empty_like(data)
+
+    # Apply filter along the time axis (axis=2)
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            filtered_data[i, j, :] = filtfilt(b, a, data[i, j, :])
+
+    return filtered_data
+
+# ===== cell 11 =====
+
+def merge_vol_multi(path_,left_,right_,bot_,top_): ## merge whole stacks with crop position
+    ls_ = sorted(os.listdir(path_))
+    print(ls_)
+    processes = []
+    queues = []
+    for index, slideID in enumerate(ls_):
+        q = Queue()
+        if index <8:
+            p = Process(target=ext_vol_multi, args=(path_ + slideID, left_, right_, q))
+        else:
+            p = Process(target=ext_vol_multi, args=(path_ + slideID, left_, 140, q))
+        p.start()
+        processes.append(p)
+        queues.append(q)
+
+    # Collect results
+    for index, (p, q) in enumerate(zip(processes, queues)):
+        if index == 0:
+            vol_no_hilbert = q.get()
+        else:
+            vol_no_hilbert = np.hstack((vol_no_hilbert, q.get()))
+    return  vol_no_hilbert
+
+# ===== cell 12 =====
+
+cdict = {
+    'red': (
+        (0.0,  0.0, 0.0),
+        (0.5,  1.0, 1.0),
+        (1.0,  1.0, 1.0),
+    ),
+    'green': (
+        (0.0,  0.0, 0.0),
+        (0.25, 0.0, 0.0),
+        (0.75, 1.0, 1.0),
+        (1.0,  1.0, 1.0),
+    ),
+    'blue': (
+        (0.0,  0.0, 0.0),
+        (0.5,  0.0, 0.0),
+        (1.0,  1.0, 1.0),
+    )
+}
+colors = [(1, 0, 0), (0.5, 0.8, 0.9), (0, 0, 1)]  # B -> G -> R
+n_bins = 1000
+cmap_name = 'rb'
+cmapbr = LinearSegmentedColormap.from_list(cmap_name, colors, N=n_bins)
+
+
+# ===== cell 13 =====
+
+cdict = {
+    'red': (
+        (0.0,  0.0, 0.0),
+        (0.5,  1.0, 1.0),
+        (1.0,  1.0, 1.0),
+    ),
+    'green': (
+        (0.0,  0.0, 0.0),
+        (0.25, 0.0, 0.0),
+        (0.75, 1.0, 1.0),
+        (1.0,  1.0, 1.0),
+    ),
+    'blue': (
+        (0.0,  0.0, 0.0),
+        (0.5,  0.0, 0.0),
+        (1.0,  1.0, 1.0),
+    )
+}
+colors = [(0, 0, 1), (1, 0, 0)]  # B -> G -> R
+n_bins = 1000
+cmap_name = 'rb'
+cmaprb = LinearSegmentedColormap.from_list(cmap_name, colors, N=n_bins)
+
+
+# ===== cell 14 =====
+
+def roll_by_map(arr_,map_):
+    new_roll_ = np.zeros(np.shape(arr_))
+    for x_indx in range(np.shape(arr_)[0]):
+        for y_indx in range(np.shape(arr_)[1]):
+            new_roll_[x_indx,y_indx,:] = np.roll(arr_[x_indx,y_indx,:],-1*int(map_[x_indx,y_indx]))
+    return new_roll_
+
+# ===== cell 15 =====
+
+import matplotlib as mpl
+
+# ===== cell 16 =====
+
+def shift_2d_replace(data, dx, dy, constant=False):
+    """
+    Shifts the array in two dimensions while setting rolled values to constant
+    :param data: The 2d numpy array to be shifted
+    :param dx: The shift in x
+    :param dy: The shift in y
+    :param constant: The constant to replace rolled values with
+    :return: The shifted array with "constant" where roll occurs
+    """
+    shifted_data = np.roll(data, dx, axis=1)
+    if dx < 0:
+        shifted_data[:, dx:] = constant
+    elif dx > 0:
+        shifted_data[:, 0:dx] = constant
+
+    shifted_data = np.roll(shifted_data, dy, axis=0)
+    if dy < 0:
+        shifted_data[dy:, :] = constant
+    elif dy > 0:
+        shifted_data[0:dy, :] = constant
+    return shifted_data
+
+# ===== cell 17 =====
+
+## Edit inside this box
+x_size = 11
+y_size = 11
+z_size = 2.5
+ftsize = 10
+depth = 2
+kernel = 1
+
+# ===== cell 18 =====
+
+bin_path = "/home/lethdat/LTD-disk/OR-PAM-data/20230314-TumorGrowing/"
+start_time = time.time()
+#bin_path_day0 = bin_path + "20200423-tumorgrowing-0day/bin5/"
+#vol_raw_day0 = merge_vol_multi(bin_path_day0,60,260,1,-1)
+
+#/home/lethdat/LTD-disk/OR-PAM-data/20230314-TumorGrowing/20200423-tumorgrowing-0day/20200423-PDT/M1/day1
+#bin_path_day1 = bin_path + "20200423-tumorgrowing-0day/20200423-PDT/day1/"
+#vol_raw_day1_tumor = merge_vol_multi(bin_path_day1,60,260,1,-1)
+
+
+#bin_path_day3 = bin_path + "20200425-tumorgowng-3day/bin3/"
+#vol_raw_day3 = merge_vol_multi(bin_path_day3,60,260,1,-1)
+
+
+#bin_path_day5_vessel= bin_path + "20200427-tumorgrowing-5day/day5-up3/"
+#vol_raw_day5_vessel = merge_vol_multi(bin_path_day5_vessel,60,260,1,-1)
+#bin_path_day5_tumor = bin_path + "20200427-tumorgrowing-5day/day5-below2/"
+#vol_raw_day5_tumor  = merge_vol_multi(bin_path_day5_tumor,60,260,1,-1)
+
+#bin_path_day7_tumor = bin_path + "20200429-tumorgrowing-7day/bin2-tumor/"
+#vol_raw_day7_tumor = merge_vol_multi(bin_path_day7_tumor,60,260,1,-1)
+
+#bin_path_day7_vessel = bin_path + "20200429-tumorgrowing-7day/bin2-vessel/"
+#vol_raw_day7_vessel = merge_vol_multi(bin_path_day7_vessel,60,260,1,-1)
+
+#bin_path_day9_tumor = bin_path + "20200501-tumorgrowing-9day/bin2-tumor/"
+#vol_raw_day9_tumor = merge_vol_multi(bin_path_day9_tumor,60,260,1,-1)
+
+#bin_path_day9_vessel = bin_path + "20200501-tumorgrowing-9day/bin2-vessel/"
+#vol_raw_day9_vessel = merge_vol_multi(bin_path_day9_vessel,60,260,1,-1)
+
+#bin_path_day9_mid = bin_path + "20200501-tumorgrowing-9day/bin2-mid/"
+#vol_raw_day9_mid = merge_vol_multi(bin_path_day9_mid,60,260,1,-1)
+
+
+bin_path_day11_tumor = bin_path + "20205003-tumorgrowing-11day/bin1-tumor/"
+vol_raw_day11_tumor = merge_vol_multi(bin_path_day11_tumor,60,260,1,-1)
+
+bin_path_day11_vessel = bin_path + "20205003-tumorgrowing-11day/bin1-vessel/"
+vol_raw_day11_vessel = merge_vol_multi(bin_path_day11_vessel,60,260,1,-1)
+
+bin_path_day11_mid = bin_path + "20205003-tumorgrowing-11day/bin3-middle/"
+vol_raw_day11_mid = merge_vol_multi(bin_path_day11_mid,60,260,1,-1)
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+print("Elapsed time:", elapsed_time, "seconds")
+
+# ===== cell 19 =====
+
+def roll_zeropad(a, shift, axis=None):
+
+    a = np.asanyarray(a)
+    if shift == 0: return a
+    if axis is None:
+        n = a.size
+        reshape = True
+    else:
+        n = a.shape[axis]
+        reshape = False
+    if np.abs(shift) > n:
+        res = np.zeros_like(a)
+    elif shift < 0:
+        shift += n
+        zeros = np.zeros_like(a.take(np.arange(n-shift), axis))
+        res = np.concatenate((a.take(np.arange(n-shift,n), axis), zeros), axis)
+    else:
+        zeros = np.zeros_like(a.take(np.arange(n-shift,n), axis))
+        res = np.concatenate((zeros, a.take(np.arange(n-shift), axis)), axis)
+    if reshape:
+        return res.reshape(a.shape)
+    else:
+        return res
+
+# ===== cell 20 =====
+
+fig, ax = plt.subplots(1,4,dpi=300)
+
+indexi = 0
+tumor_vol_t = norm(vol_raw_day11_tumor[:,:,:350])
+tumor_vol_t[:200,:,:] = 0
+tumor_vol_t[:,400:,:] = 0
+tumor_vol_t = np.where(tumor_vol_t>0.11,0.11,tumor_vol_t)
+tumor_vol = norm(np.where(tumor_vol_t<0.1,0.1,tumor_vol_t))
+ax[indexi].imshow(median_filter(map_ax(tumor_vol,2),3),cmap="gray",extent=[0,x_size,0,y_size],vmin=0,vmax=1)
+
+indexi += 1
+middl_vol_t = norm(vol_raw_day11_mid[:,:,100:450])
+middl_vol_t[:150,:,:] = 0
+middl_vol_t[:,550:,:] = 0
+middl_vol_t = np.where(middl_vol_t>0.13,0.13,middl_vol_t)
+middl_vol = norm(np.where(middl_vol_t<0.1,0.1,middl_vol_t))
+ax[indexi].imshow(median_filter(map_ax(middl_vol,2),3),cmap="gray",extent=[0,x_size,0,y_size],vmin=0,vmax=1)
+
+indexi += 1
+vess_vol_t = norm(vol_raw_day11_vessel[:,:,50:250])
+vess_vol_t = np.where(vess_vol_t>0.30,0.30,vess_vol_t)
+vess_vol = norm(np.where(vess_vol_t<0.22,0.22,vess_vol_t))
+ax[indexi].imshow(median_filter(map_ax(vess_vol,2),3),cmap="gray",extent=[0,x_size,0,y_size],vmin=0,vmax=1)
+void_vol = np.zeros((500, 840, 1024-np.shape(tumor_vol)[2]-np.shape(vess_vol)[2]))
+
+vol = np.dstack((void_vol,tumor_vol,middl_vol,vess_vol))[50:-10,:-130,:]
+
+indexi += 1
+ax[indexi].imshow(map_ax(vol,2),cmap="gray",extent=[0,x_size,0,y_size],vmax=1,vmin=0)
+for indx in range(4):
+    ax[indx].set_xticks([])
+    ax[indx].set_yticks([])
+plt.show()
+
+# ===== cell 23 =====
+
+fig, ax = plt.subplots(1,1,dpi=300)
+
+indexi = 0
+ax.imshow(median_filter(map_ax(vol,2),1),cmap="gray",extent=[0,x_size,0,y_size],vmin=0,vmax=1)
+map_mask = np.where(map_ax(vol,2)>0.2,1,0)
+#indexi += 1
+#middl_vol = norm(vol_raw_day5_mid[:,:,:380])
+#ax[indexi].imshow(median_filter(map_ax(middl_vol,2),3),cmap="hot",extent=[0,x_size,0,y_size],vmin=0,vmax=0.3)
+#indexi += 1
+#vess_vol = norm(vol_raw_day5_vessel[:,:,100:380])
+#ax[indexi].imshow(median_filter(map_ax(vess_vol,2),3),cmap="hot",extent=[0,x_size,0,y_size],vmin=0,vmax=0.15)
+#void_vol = np.zeros((498, 840, 1024-np.shape(tumor_vol)[2]-np.shape(vess_vol)[2]))
+
+ax.set_xticks([])
+ax.set_yticks([])
+plt.show()
+
+# ===== cell 24 =====
+
+map_mask = np.where(map_ax(vol,2)>0.4,1,0)
+plt.imshow(map_mask)
+plt.show()
+
+# ===== cell 25 =====
+
+fig, ax = plt.subplots(1,1,dpi=300)
+
+indexi = 0
+ax.imshow(np.rot90(median_filter(np.max(vol,0),3),-1),cmap="gray",extent=[0,x_size,0,z_size],vmin=0.,vmax=1)
+#indexi += 1
+#middl_vol = norm(vol_raw_day5_mid[:,:,:380])
+#ax[indexi].imshow(median_filter(map_ax(middl_vol,2),3),cmap="hot",extent=[0,x_size,0,y_size],vmin=0,vmax=0.3)
+#indexi += 1
+#vess_vol = norm(vol_raw_day5_vessel[:,:,100:380])
+#ax[indexi].imshow(median_filter(map_ax(vess_vol,2),3),cmap="hot",extent=[0,x_size,0,y_size],vmin=0,vmax=0.15)
+#void_vol = np.zeros((498, 840, 1024-np.shape(tumor_vol)[2]-np.shape(vess_vol)[2]))
+
+ax.set_xticks([])
+ax.set_yticks([])
+plt.show()
+
+# ===== cell 26 =====
+
+fig, ax = plt.subplots(1,1,dpi=300)
+
+indexi = 0
+ax.imshow(median_filter(np.argmax(vol,2),1),cmap="jet_r",extent=[0,x_size,0,y_size],vmin=200,vmax=1200,alpha=norm(map_mask)**(1/2))
+#indexi += 1
+#middl_vol = norm(vol_raw_day5_mid[:,:,:380])
+#ax[indexi].imshow(median_filter(map_ax(middl_vol,2),3),cmap="hot",extent=[0,x_size,0,y_size],vmin=0,vmax=0.3)
+#indexi += 1
+#vess_vol = norm(vol_raw_day5_vessel[:,:,100:380])
+#ax[indexi].imshow(median_filter(map_ax(vess_vol,2),3),cmap="hot",extent=[0,x_size,0,y_size],vmin=0,vmax=0.15)
+#void_vol = np.zeros((498, 840, 1024-np.shape(tumor_vol)[2]-np.shape(vess_vol)[2]))
+
+ax.set_xticks([])
+ax.set_yticks([])
+ax.set_facecolor("black")
+
+plt.show()
+
+# ===== cell 27 =====
+
+from scipy.ndimage import rotate
+
+new_vol = resize(vol,(500,500,100))
+
+rot_vol = rotate(new_vol, angle=35, axes=(0, 1), reshape=True, order=3)
+rot_vol = rotate(rot_vol, angle=15, axes=(2, 1), reshape=True, order=3)
+
+
+# ===== cell 28 =====
+
+fig, ax = plt.subplots(dpi=300)
+ax.imshow(np.rot90(median_filter(np.max(rot_vol,1),1),-1),cmap="gray",extent=[0,7,0,7],vmin=0.09,vmax=0.6)
+ax.set_xticks([])
+ax.set_yticks([])
+plt.show()
+
+# ===== cell 29 =====
+
+import nrrd
+nrrd.write("pa_day11.nrrd",vol)
+
+# ===== cell 30 =====
+
+
+$
